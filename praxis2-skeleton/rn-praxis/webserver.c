@@ -233,7 +233,8 @@ static int setup_server_socket(struct sockaddr_in addr) {
 
     // Create a socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == -1) {
+    int sockDgram = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == -1 || sockDgram == -1) {
         perror("socket");
         exit(EXIT_FAILURE);
     }
@@ -243,15 +244,28 @@ static int setup_server_socket(struct sockaddr_in addr) {
         perror("fcntl");
         exit(EXIT_FAILURE);
     }
+    if (fcntl(sockDgram, F_SETFL, O_NONBLOCK) == -1) {
+        perror("fcntl");
+        exit(EXIT_FAILURE);
+    }
 
     // Set the SO_REUSEADDR socket option to allow reuse of local addresses
     if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
         perror("setsockopt");
         exit(EXIT_FAILURE);
     }
+    if (setsockopt(sockDgram, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
 
     // Bind socket to the provided address
     if (bind(sock, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
+        perror("bind");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+    if (bind(sockDgram, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
         perror("bind");
         close(sock);
         exit(EXIT_FAILURE);
