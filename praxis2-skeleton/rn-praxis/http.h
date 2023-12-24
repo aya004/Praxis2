@@ -26,6 +26,7 @@ struct request {
     struct header headers[HTTP_MAX_HEADERS];
     char* payload;
     ssize_t payload_length;
+
 };
 
 

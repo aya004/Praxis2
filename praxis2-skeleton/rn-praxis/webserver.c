@@ -26,14 +26,21 @@ struct tuple resources[MAX_RESOURCES] = {
     {"/static/baz", "Baz", sizeof "Baz" - 1}
 };
 
-
+typedef struct Node{
+  int id;
+  char *ip;
+  int port;
+  struct Node* pred;
+  struct Node* succ;
+} Node;
+uint16_t hash_value;
 /**
  * Sends an HTTP reply to the client based on the received request.
  *
  * @param conn      The file descriptor of the client connection socket.
  * @param request   A pointer to the struct containing the parsed request information.
  */
-void send_reply(int conn, struct request* request) {
+void send_reply(int conn, struct request* request, struct Node* node) {
 
     // Create a buffer to hold the HTTP reply
     char buffer[HTTP_MAX_SIZE];
@@ -46,12 +53,23 @@ void send_reply(int conn, struct request* request) {
         // Find the resource with the given URI in the 'resources' array.
         size_t resource_length;
         const char* resource = get(request->uri, resources, MAX_RESOURCES, &resource_length);
+        if(node->port != 0){
+            if(hash_value > node->id && hash_value <= node->succ->id){
+                sprintf(reply, "HTTP/1.1 303 See Other\r\nLocation: http://%.*s:%d%.*s", (int) strlen(node->succ->ip), node->succ->ip, node->succ->port,
+                        (int) strlen(request->uri), request->uri);
 
-        if (resource) {
-            sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n%.*s", resource_length, (int) resource_length, resource);
-        } else {
-            reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            }
+            else{
+                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            }
+        } else{
+            if (resource) {
+                sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n%.*s", resource_length, (int) resource_length, resource);
+            } else {
+                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            }
         }
+
     } else if (strcmp(request->method, "PUT") == 0) {
         // Try to set the requested resource with the given payload in the 'resources' array.
         if (set(request->uri, request->payload, request->payload_length, resources, MAX_RESOURCES
@@ -77,6 +95,11 @@ void send_reply(int conn, struct request* request) {
         close(conn);
     }
 }
+uint16_t hash(const char* str){ //Copied from Aufgabenblatt
+    uint8_t digest[SHA256_DIGEST_LENGTH];
+    SHA256((uint8_t *)str, strlen(str), digest);
+    return htons(*((uint16_t *)digest)); // We only use the first two bytes here
+}
 
 /**
  * Processes an incoming packet from the client.
@@ -90,17 +113,19 @@ void send_reply(int conn, struct request* request) {
  *         If the packet is malformed or an error occurs during processing, the return value is -1.
  *
  */
-size_t process_packet(int conn, char* buffer, size_t n) {
+size_t process_packet(int conn, char* buffer, size_t n, struct Node* node) {
     struct request request = {
         .method = NULL,
         .uri = NULL,
         .payload = NULL,
-        .payload_length = -1
+        .payload_length = -1,
+
     };
     ssize_t bytes_processed = parse_request(buffer, n, &request);
+    hash_value = hash(request.uri);
 
     if (bytes_processed > 0) {
-        send_reply(conn, &request);
+        send_reply(conn, &request, node);
 
         // Check the "Connection" header in the request to determine if the connection should be kept alive or closed.
         const string connection_header = get_header(&request, "Connection");
@@ -162,7 +187,7 @@ char* buffer_discard(char* buffer, size_t discard, size_t keep) {
  * @return Returns true if the connection and data processing were successful, false otherwise.
  *         If an error occurs while receiving data from the socket, the function exits the program.
  */
-bool handle_connection(struct connection_state* state) {
+bool handle_connection(struct connection_state* state, struct Node* node) {
     // Calculate the pointer to the end of the buffer to avoid buffer overflow
     const char* buffer_end = state->buffer + HTTP_MAX_SIZE;
 
@@ -180,7 +205,7 @@ bool handle_connection(struct connection_state* state) {
     char* window_end = state->end + bytes_read;
 
     ssize_t bytes_processed = 0;
-    while((bytes_processed = process_packet(state->sock, window_start, window_end - window_start)) > 0) {
+    while((bytes_processed = process_packet(state->sock, window_start, window_end - window_start, node)) > 0) {
         window_start += bytes_processed;
     }
     if (bytes_processed == -1) {
@@ -280,6 +305,19 @@ static int setup_server_socket(struct sockaddr_in addr) {
     return sock;
 }
 
+Node* initialize(char* ip, int port, int id){
+    Node* node = (Node*)malloc(sizeof(Node));
+    if(node != NULL){
+        node->ip = calloc(8, sizeof(char));
+        memcpy(node->ip, ip, strlen(ip));
+        node->port = port;
+        node->id = id;
+        node->pred = NULL;
+        node->succ = NULL;
+    }
+    return node;
+}
+
 /**
 *  The program expects 3; otherwise, it returns EXIT_FAILURE.
 *
@@ -288,9 +326,21 @@ static int setup_server_socket(struct sockaddr_in addr) {
 *  ./build/webserver self.ip self.port
 */
 int main(int argc, char** argv) {
-    if (argc != 3) {
+    if (argc < 3) {
         return EXIT_FAILURE;
     }
+    Node* node;
+    if(argc == 4) {
+        node = initialize(argv[1], atoi(argv[2]), atoi(argv[3]));
+        Node* succ = initialize(getenv("SUCC_IP"), atoi(getenv("SUCC_PORT")), atoi(getenv("SUCC_ID")));
+        Node* pred = initialize(getenv("PRED_IP"), atoi(getenv("PRED_PORT")), atoi(getenv("PRED_ID")));
+        node->succ = succ;
+        node->pred = pred;
+    }
+    if(argc == 3){
+        node = initialize(argv[1], atoi(argv[2]), 0);
+    }
+
 
     struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
 
@@ -340,7 +390,7 @@ int main(int argc, char** argv) {
                 assert(s == state.sock);
 
                 // Call the 'handle_connection' function to process the incoming data on the socket.
-                bool cont = handle_connection(&state);
+                bool cont = handle_connection(&state, node);
                 if (!cont) {  // get ready for a new connection
                     sockets[0].events = POLLIN;
                     sockets[1].fd = -1;
@@ -350,6 +400,7 @@ int main(int argc, char** argv) {
         }
 
     }
+
 
     return EXIT_SUCCESS;
 }
