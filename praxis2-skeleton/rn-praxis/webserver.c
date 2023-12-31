@@ -175,7 +175,7 @@ void lookup_send(struct Node* node, unsigned short hash_value){
     msg->id = htons(node->id);
     msg->ip = self_addr.s_addr;
     msg->port = htons(node->port);
-    sendto(node_socket, msg, 11, 0, (struct sockaddr*) &addr, sizeof(addr));
+    sendto(node_socket, msg, sizeof(Message), 0, (struct sockaddr*) &addr, sizeof(addr));
 }
 void send_reply(int conn, struct request* request, struct Node* node, unsigned short hash_value) {
 
