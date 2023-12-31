@@ -32,7 +32,7 @@ typedef struct Node{
     uint16_t port;
     struct Node* pred;
     struct Node* succ;
-} Node;
+}__attribute__((packed)) Node;
 
 int sockDgram;
 
