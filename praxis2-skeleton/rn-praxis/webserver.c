@@ -34,7 +34,8 @@ typedef struct Node{
     struct Node* succ;
 }__attribute__((packed)) Node;
 
-int sockDgram;
+
+int node_socket;
 
 typedef struct Message{
    uint8_t flag;
@@ -43,6 +44,8 @@ typedef struct Message{
    uint32_t ip;
    uint16_t port;
 }__attribute__((packed)) Message;
+
+
 /**
  * Sends an HTTP reply to the client based on the received request.
  *
@@ -82,15 +85,9 @@ int udp_node_socket(struct sockaddr_in addr){
     const int enable = 1;
 
     // Create a socket
-    sockDgram = socket(AF_INET, SOCK_DGRAM, 0);
+    int sockDgram = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockDgram == -1) {
         perror("socket");
-        exit(EXIT_FAILURE);
-    }
-
-    // Avoid dead lock on connections that are dropped after poll returns but before accept is called
-    if (fcntl(sockDgram, F_SETFL, O_NONBLOCK) == -1) {
-        perror("fcntl");
         exit(EXIT_FAILURE);
     }
 
@@ -119,9 +116,6 @@ int udp_node_socket(struct sockaddr_in addr){
 static int setup_server_socket(struct sockaddr_in addr) {
     const int enable = 1;
     const int backlog = 1;
-
-    //udp_socket
-    sockDgram = udp_node_socket(addr);
 
     // Create a socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -158,9 +152,64 @@ static int setup_server_socket(struct sockaddr_in addr) {
     return sock;
 }
 
+void lookup_reply(struct Node* node) {
+
+    struct sockaddr_in serveraddr;
+    char port[6];
+    snprintf(port, sizeof(port), "%d", node->port);
+
+    serveraddr = derive_sockaddr(node->ip, port);
+
+    int sock = udp_node_socket(serveraddr);
+
+    struct sockaddr_in clientaddr;
+    socklen_t addr_len = sizeof(clientaddr);
+    bzero(&clientaddr, sizeof(clientaddr));
+    struct Message *msg = malloc(sizeof(struct Message));
+    ssize_t recvm = recvfrom(sock, msg, sizeof(Message), 0, (struct sockaddr*)&clientaddr, &addr_len);
+
+    if(recvm == -1){
+        perror("recvfrom");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+    if(htons(msg->hash) > node->id && htons(msg->hash) <= node->succ->id){ //lookup_reply
+        struct in_addr self_addr;
+        inet_pton(AF_INET, node->succ->ip, &self_addr.s_addr);
+
+        struct Message* reply = malloc(sizeof(Message));
+        reply->flag = 1;
+        reply->hash = htons(node->id);
+        reply->id = htons(node->succ->id);
+        reply->ip = self_addr.s_addr;
+        reply->port = htons(node->succ->port);
+
+        struct sockaddr_in predaddr;
+        char predport[6];
+        snprintf(predport, sizeof(port), "%d", node->pred->port);
+
+        predaddr = derive_sockaddr(node->pred->ip, predport);
+
+       sendto(sock, reply, sizeof(Message), 0, (struct sockaddr*) &predaddr, sizeof(predaddr));
+
+    } else{ //lookup_forward
+
+        struct sockaddr_in predaddr;
+        char predport[6];
+        snprintf(predport, sizeof(port), "%d", node->succ->port);
+
+        predaddr = derive_sockaddr(node->succ->ip, predport);
+
+        sendto(sock, msg, sizeof(Message), 0, (struct sockaddr*) &predaddr, sizeof(predaddr));
+    }
+
+
+
+}
 void lookup_send(struct Node* node, unsigned short hash_value){
     struct sockaddr_in addr;
-    int node_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    node_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(node->succ->port);
     inet_pton(AF_INET, node->succ->ip, &addr.sin_addr);
@@ -175,7 +224,9 @@ void lookup_send(struct Node* node, unsigned short hash_value){
     msg->ip = self_addr.s_addr;
     msg->port = htons(node->port);
     sendto(node_socket, msg, sizeof(Message), 0, (struct sockaddr*) &addr, sizeof(addr));
+
 }
+
 void send_reply(int conn, struct request* request, struct Node* node, unsigned short hash_value) {
 
     // Create a buffer to hold the HTTP reply
@@ -186,17 +237,16 @@ void send_reply(int conn, struct request* request, struct Node* node, unsigned s
     fprintf(stderr, "Handling %s request for %s (%lu byte payload)\n", request->method, request->uri, request->payload_length);
     if(node->port != 0){
         if(hash_value > node->id && hash_value <= node->succ->id){
-            sprintf(reply, "HTTP/1.1 303 See Other\r\nLocation: http://%.*s:%d%.*s", (int) strlen(node->succ->ip), node->succ->ip, node->succ->port,
-                    (int) strlen(request->uri), request->uri);
+            sprintf(reply, "HTTP/1.1 303 See Other\r\nLocation: http://%.*s:%d%.*s", (int) strlen(node->succ->ip), node->succ->ip, node->succ->port,(int) strlen(request->uri), request->uri);
+        }else{
+            reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         }
-        else{
-            if(node->pred->id != node->succ->id){
-                reply = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n ";
-                lookup_send(node, hash_value);
-            }else{
-                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-            }
+
+        if(node->pred->id != node->succ->id) {
+            reply = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n ";
+            lookup_send(node, hash_value);
         }
+
     }
     else if (strcmp(request->method, "GET") == 0) {
         // Find the resource with the given URI in the 'resources' array.
@@ -391,6 +441,9 @@ int main(int argc, char** argv) {
         Node* pred = initialize(getenv("PRED_IP"), atoi(getenv("PRED_PORT")), atoi(getenv("PRED_ID")));
         node->succ = succ;
         node->pred = pred;
+        if(node->pred->id < node->id){
+            lookup_reply(node);
+        }
     }
     if(argc == 3){
         node = initialize(argv[1], atoi(argv[2]), 0);
@@ -401,6 +454,9 @@ int main(int argc, char** argv) {
 
     // Set up a server socket.
     int server_socket = setup_server_socket(addr);
+
+    //udp_socket
+    int sockDgram = udp_node_socket(addr);
 
     // Create an array of pollfd structures to monitor sockets.
     struct pollfd sockets[2] = {
