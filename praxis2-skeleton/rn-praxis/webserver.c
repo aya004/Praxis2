@@ -27,12 +27,11 @@ struct tuple resources[MAX_RESOURCES] = {
 };
 
 typedef struct Node{
-
     uint16_t id;
-  char *ip;
+    char *ip;
     uint16_t port;
-  struct Node* pred;
-  struct Node* succ;
+    struct Node* pred;
+    struct Node* succ;
 } Node;
 
 int sockDgram;
@@ -122,7 +121,7 @@ static int setup_server_socket(struct sockaddr_in addr) {
     const int backlog = 1;
 
     //udp_socket
-    int sock_udp = udp_node_socket(addr);
+    sockDgram = udp_node_socket(addr);
 
     // Create a socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -193,7 +192,6 @@ void send_reply(int conn, struct request* request, struct Node* node, unsigned s
         else{
             if(node->pred->id != node->succ->id){
                 reply = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n ";
-                send(conn, reply, strlen(reply), 0);
                 lookup_send(node, hash_value);
             }else{
                 reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
