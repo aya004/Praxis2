@@ -27,20 +27,157 @@ struct tuple resources[MAX_RESOURCES] = {
 };
 
 typedef struct Node{
-  int id;
+
+    uint16_t id;
   char *ip;
-  int port;
+    uint16_t port;
   struct Node* pred;
   struct Node* succ;
 } Node;
-uint16_t hash_value;
+
+int sockDgram;
+
+typedef struct Message{
+   uint8_t flag;
+   uint16_t hash;
+   uint16_t id;
+   uint32_t ip;
+   uint16_t port;
+}__attribute__((packed)) Message;
 /**
  * Sends an HTTP reply to the client based on the received request.
  *
  * @param conn      The file descriptor of the client connection socket.
  * @param request   A pointer to the struct containing the parsed request information.
  */
-void send_reply(int conn, struct request* request, struct Node* node) {
+/**
+* Derives a sockaddr_in structure from the provided host and port information.
+*
+* @param host The host (IP address or hostname) to be resolved into a network address.
+* @param port The port number to be converted into network byte order.
+*
+* @return A sockaddr_in structure representing the network address derived from the host and port.
+*/
+static struct sockaddr_in derive_sockaddr(const char* host, const char* port) {
+    struct addrinfo hints = {
+            .ai_family = AF_INET,
+    };
+    struct addrinfo *result_info;
+
+    // Resolve the host (IP address or hostname) into a list of possible addresses.
+    int returncode = getaddrinfo(host, port, &hints, &result_info);
+    if (returncode) {
+        fprintf(stderr, "Error parsing host/port");
+        exit(EXIT_FAILURE);
+    }
+
+    // Copy the sockaddr_in structure from the first address in the list
+    struct sockaddr_in result = *((struct sockaddr_in*) result_info->ai_addr);
+
+    // Free the allocated memory for the result_info
+    freeaddrinfo(result_info);
+    return result;
+}
+
+int udp_node_socket(struct sockaddr_in addr){
+    const int enable = 1;
+
+    // Create a socket
+    sockDgram = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockDgram == -1) {
+        perror("socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // Avoid dead lock on connections that are dropped after poll returns but before accept is called
+    if (fcntl(sockDgram, F_SETFL, O_NONBLOCK) == -1) {
+        perror("fcntl");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set the SO_REUSEADDR socket option to allow reuse of local addresses
+    if (setsockopt(sockDgram, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind socket to the provided address
+    if (bind(sockDgram, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
+        perror("bind");
+        close(sockDgram);
+        exit(EXIT_FAILURE);
+    }
+
+    return sockDgram;
+}
+/**
+ * Sets up a TCP server socket and binds it to the provided sockaddr_in address.
+ *
+ * @param addr The sockaddr_in structure representing the IP address and port of the server.
+ *
+ * @return The file descriptor of the created TCP server socket.
+ */
+static int setup_server_socket(struct sockaddr_in addr) {
+    const int enable = 1;
+    const int backlog = 1;
+
+    //udp_socket
+    int sock_udp = udp_node_socket(addr);
+
+    // Create a socket
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        perror("socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // Avoid dead lock on connections that are dropped after poll returns but before accept is called
+    if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+        perror("fcntl");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set the SO_REUSEADDR socket option to allow reuse of local addresses
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind socket to the provided address
+    if (bind(sock, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
+        perror("bind");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+
+    // Start listening on the socket with maximum backlog of 1 pending connection
+    if (listen(sock, backlog)) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    return sock;
+}
+
+void lookup_send(struct Node* node, unsigned short hash_value){
+    struct sockaddr_in addr;
+    int node_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(node->succ->port);
+    inet_pton(AF_INET, node->succ->ip, &addr.sin_addr);
+
+    struct in_addr self_addr;
+    inet_pton(AF_INET, node->ip, &self_addr.s_addr);
+
+    struct Message* msg = malloc(sizeof(Message));
+    msg->flag = htons(0);
+    msg->hash = htons(hash_value);
+    msg->id = htons(node->id);
+    msg->ip = self_addr.s_addr;
+    msg->port = htons(node->port);
+    sendto(node_socket, msg, 11, 0, (struct sockaddr*) &addr, sizeof(addr));
+}
+void send_reply(int conn, struct request* request, struct Node* node, unsigned short hash_value) {
 
     // Create a buffer to hold the HTTP reply
     char buffer[HTTP_MAX_SIZE];
@@ -48,26 +185,29 @@ void send_reply(int conn, struct request* request, struct Node* node) {
 
 
     fprintf(stderr, "Handling %s request for %s (%lu byte payload)\n", request->method, request->uri, request->payload_length);
-
-    if (strcmp(request->method, "GET") == 0) {
+    if(node->port != 0){
+        if(hash_value > node->id && hash_value <= node->succ->id){
+            sprintf(reply, "HTTP/1.1 303 See Other\r\nLocation: http://%.*s:%d%.*s", (int) strlen(node->succ->ip), node->succ->ip, node->succ->port,
+                    (int) strlen(request->uri), request->uri);
+        }
+        else{
+            if(node->pred->id != node->succ->id){
+                reply = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n ";
+                send(conn, reply, strlen(reply), 0);
+                lookup_send(node, hash_value);
+            }else{
+                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            }
+        }
+    }
+    else if (strcmp(request->method, "GET") == 0) {
         // Find the resource with the given URI in the 'resources' array.
         size_t resource_length;
         const char* resource = get(request->uri, resources, MAX_RESOURCES, &resource_length);
-        if(node->port != 0){
-            if(hash_value > node->id && hash_value <= node->succ->id){
-                sprintf(reply, "HTTP/1.1 303 See Other\r\nLocation: http://%.*s:%d%.*s", (int) strlen(node->succ->ip), node->succ->ip, node->succ->port,
-                        (int) strlen(request->uri), request->uri);
-
-            }
-            else{
-                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-            }
-        } else{
-            if (resource) {
-                sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n%.*s", resource_length, (int) resource_length, resource);
-            } else {
-                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-            }
+        if (resource) {
+            sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n%.*s", resource_length, (int) resource_length, resource);
+        } else {
+            reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         }
 
     } else if (strcmp(request->method, "PUT") == 0) {
@@ -95,6 +235,7 @@ void send_reply(int conn, struct request* request, struct Node* node) {
         close(conn);
     }
 }
+
 uint16_t hash(const char* str){ //Copied from Aufgabenblatt
     uint8_t digest[SHA256_DIGEST_LENGTH];
     SHA256((uint8_t *)str, strlen(str), digest);
@@ -122,10 +263,11 @@ size_t process_packet(int conn, char* buffer, size_t n, struct Node* node) {
 
     };
     ssize_t bytes_processed = parse_request(buffer, n, &request);
+    unsigned short hash_value;
     hash_value = hash(request.uri);
 
     if (bytes_processed > 0) {
-        send_reply(conn, &request, node);
+        send_reply(conn, &request, node, hash_value);
 
         // Check the "Connection" header in the request to determine if the connection should be kept alive or closed.
         const string connection_header = get_header(&request, "Connection");
@@ -216,99 +358,14 @@ bool handle_connection(struct connection_state* state, struct Node* node) {
     return true;
 }
 
-/**
- * Derives a sockaddr_in structure from the provided host and port information.
- *
- * @param host The host (IP address or hostname) to be resolved into a network address.
- * @param port The port number to be converted into network byte order.
- *
- * @return A sockaddr_in structure representing the network address derived from the host and port.
- */
-static struct sockaddr_in derive_sockaddr(const char* host, const char* port) {
-    struct addrinfo hints = {
-        .ai_family = AF_INET,
-    };
-    struct addrinfo *result_info;
 
-    // Resolve the host (IP address or hostname) into a list of possible addresses.
-    int returncode = getaddrinfo(host, port, &hints, &result_info);
-    if (returncode) {
-        fprintf(stderr, "Error parsing host/port");
-        exit(EXIT_FAILURE);
-    }
 
-    // Copy the sockaddr_in structure from the first address in the list
-    struct sockaddr_in result = *((struct sockaddr_in*) result_info->ai_addr);
 
-    // Free the allocated memory for the result_info
-    freeaddrinfo(result_info);
-    return result;
-}
-
-/**
- * Sets up a TCP server socket and binds it to the provided sockaddr_in address.
- *
- * @param addr The sockaddr_in structure representing the IP address and port of the server.
- *
- * @return The file descriptor of the created TCP server socket.
- */
-static int setup_server_socket(struct sockaddr_in addr) {
-    const int enable = 1;
-    const int backlog = 1;
-
-    // Create a socket
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    int sockDgram = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock == -1 || sockDgram == -1) {
-        perror("socket");
-        exit(EXIT_FAILURE);
-    }
-
-    // Avoid dead lock on connections that are dropped after poll returns but before accept is called
-    if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
-        perror("fcntl");
-        exit(EXIT_FAILURE);
-    }
-    if (fcntl(sockDgram, F_SETFL, O_NONBLOCK) == -1) {
-        perror("fcntl");
-        exit(EXIT_FAILURE);
-    }
-
-    // Set the SO_REUSEADDR socket option to allow reuse of local addresses
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-    if (setsockopt(sockDgram, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-
-    // Bind socket to the provided address
-    if (bind(sock, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
-        perror("bind");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-    if (bind(sockDgram, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
-        perror("bind");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-
-    // Start listening on the socket with maximum backlog of 1 pending connection
-    if (listen(sock, backlog)) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    return sock;
-}
 
 Node* initialize(char* ip, int port, int id){
     Node* node = (Node*)malloc(sizeof(Node));
     if(node != NULL){
-        node->ip = calloc(8, sizeof(char));
+        node->ip = calloc(sizeof(ip), sizeof(char));
         memcpy(node->ip, ip, strlen(ip));
         node->port = port;
         node->id = id;
