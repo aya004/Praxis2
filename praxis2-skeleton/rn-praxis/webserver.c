@@ -35,7 +35,7 @@ typedef struct Node{
 }__attribute__((packed)) Node;
 
 
-int node_socket;
+
 
 typedef struct Message{
    uint8_t flag;
@@ -44,6 +44,11 @@ typedef struct Message{
    uint32_t ip;
    uint16_t port;
 }__attribute__((packed)) Message;
+
+typedef struct List{
+    struct Node* res;
+    struct List* next;
+}__attribute__((packed)) List;
 
 
 /**
@@ -83,6 +88,7 @@ static struct sockaddr_in derive_sockaddr(const char* host, const char* port) {
 
 int udp_node_socket(struct sockaddr_in addr){
     const int enable = 1;
+    
 
     // Create a socket
     int sockDgram = socket(AF_INET, SOCK_DGRAM, 0);
@@ -103,6 +109,7 @@ int udp_node_socket(struct sockaddr_in addr){
         close(sockDgram);
         exit(EXIT_FAILURE);
     }
+
 
     return sockDgram;
 }
@@ -167,7 +174,6 @@ void lookup_reply(struct Node* node) {
     bzero(&clientaddr, sizeof(clientaddr));
     struct Message *msg = malloc(sizeof(struct Message));
     ssize_t recvm = recvfrom(sock, msg, sizeof(Message), 0, (struct sockaddr*)&clientaddr, &addr_len);
-
     if(recvm == -1){
         perror("recvfrom");
         close(sock);
@@ -184,23 +190,19 @@ void lookup_reply(struct Node* node) {
         reply->ip = self_addr.s_addr;
         reply->port = htons(node->succ->port);
 
-        struct sockaddr_in predaddr;
-        char predport[6];
-        snprintf(predport, sizeof(port), "%d", node->pred->port);
 
-        predaddr = derive_sockaddr(node->pred->ip, predport);
+       sendto(sock, reply, sizeof(Message), 0, (struct sockaddr*) &clientaddr, sizeof(clientaddr));
 
-       sendto(sock, reply, sizeof(Message), 0, (struct sockaddr*) &predaddr, sizeof(predaddr));
+    }
+    while(htons(msg->hash) > node->id && htons(msg->hash) > node->succ->id){ //lookup_forward
 
-    } else{ //lookup_forward
+        struct sockaddr_in succaddr;
+        char succport[6];
+        snprintf(succport, sizeof(port), "%d", node->succ->port);
 
-        struct sockaddr_in predaddr;
-        char predport[6];
-        snprintf(predport, sizeof(port), "%d", node->succ->port);
+        succaddr = derive_sockaddr(node->succ->ip, succport);
 
-        predaddr = derive_sockaddr(node->succ->ip, predport);
-
-        sendto(sock, msg, sizeof(Message), 0, (struct sockaddr*) &predaddr, sizeof(predaddr));
+        sendto(sock, msg, sizeof(Message), 0, (struct sockaddr*) &succaddr, sizeof(succaddr));
     }
 
 
@@ -208,11 +210,13 @@ void lookup_reply(struct Node* node) {
 }
 void lookup_send(struct Node* node, unsigned short hash_value){
     struct sockaddr_in addr;
-    node_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    int node_socket = socket(AF_INET, SOCK_DGRAM, 0);
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(node->succ->port);
     inet_pton(AF_INET, node->succ->ip, &addr.sin_addr);
+
+
 
     struct in_addr self_addr;
     inet_pton(AF_INET, node->ip, &self_addr.s_addr);
@@ -224,7 +228,41 @@ void lookup_send(struct Node* node, unsigned short hash_value){
     msg->ip = self_addr.s_addr;
     msg->port = htons(node->port);
     sendto(node_socket, msg, sizeof(Message), 0, (struct sockaddr*) &addr, sizeof(addr));
+    close(node_socket);
 
+}
+
+struct Node* reply_check(struct Node* node){
+    struct sockaddr_in serveraddr;
+    char port[6];
+    snprintf(port, sizeof(port), "%d", node->port);
+
+    serveraddr = derive_sockaddr(node->ip, port);
+
+    int sock = udp_node_socket(serveraddr);
+
+    struct sockaddr_in clientaddr;
+    socklen_t addr_len = sizeof(clientaddr);
+    bzero(&clientaddr, sizeof(clientaddr));
+    struct Message *msg = malloc(sizeof(struct Message));
+    ssize_t recvm = recvfrom(sock, msg, sizeof(Message), 0, (struct sockaddr*)&clientaddr, &addr_len);
+    fprintf(stderr, "%ld\n", recvm);
+    if(recvm == -1){
+        perror("recvfrom");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+    struct Node* responsible = malloc(sizeof(Node));
+    responsible->id = msg->id;
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &msg->ip, ip, INET_ADDRSTRLEN);
+    fprintf(stderr, "%s\n", ip);
+    responsible->ip = calloc(sizeof(ip), sizeof(char));
+    memcpy(responsible->ip, ip, strlen(ip));
+    fprintf(stderr, "%s\n", responsible->ip);
+    responsible->port = ntohs(msg->port);
+    fprintf(stderr, "%d\n", responsible->port);
+    return responsible;
 }
 
 void send_reply(int conn, struct request* request, struct Node* node, unsigned short hash_value) {
@@ -232,50 +270,64 @@ void send_reply(int conn, struct request* request, struct Node* node, unsigned s
     // Create a buffer to hold the HTTP reply
     char buffer[HTTP_MAX_SIZE];
     char *reply = buffer;
+    char *rep = buffer;
 
 
     fprintf(stderr, "Handling %s request for %s (%lu byte payload)\n", request->method, request->uri, request->payload_length);
-    if(node->port != 0){
-        if(hash_value > node->id && hash_value <= node->succ->id){
-            sprintf(reply, "HTTP/1.1 303 See Other\r\nLocation: http://%.*s:%d%.*s", (int) strlen(node->succ->ip), node->succ->ip, node->succ->port,(int) strlen(request->uri), request->uri);
-        }else{
-            reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+
+    if(node != NULL){
+        if(node->pred->id == node->succ->id){
+            if(hash_value > node->id && hash_value <= node->succ->id){
+                sprintf(reply, "HTTP/1.1 303 See Other\r\nLocation: http://%.*s:%d%.*s\r\nContent-Length: 0\r\n\r\n", (int) strlen(node->succ->ip), node->succ->ip, node->succ->port,(int) strlen(request->uri), request->uri);
+            }else{
+                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            }
         }
 
         if(node->pred->id != node->succ->id) {
-            reply = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n ";
-            lookup_send(node, hash_value);
-        }
 
-    }
-    else if (strcmp(request->method, "GET") == 0) {
-        // Find the resource with the given URI in the 'resources' array.
-        size_t resource_length;
-        const char* resource = get(request->uri, resources, MAX_RESOURCES, &resource_length);
-        if (resource) {
-            sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n%.*s", resource_length, (int) resource_length, resource);
-        } else {
-            reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-        }
+            rep = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
+            send(conn, rep, strlen(rep), 0);
 
-    } else if (strcmp(request->method, "PUT") == 0) {
-        // Try to set the requested resource with the given payload in the 'resources' array.
-        if (set(request->uri, request->payload, request->payload_length, resources, MAX_RESOURCES
-        )) {
-            reply = "HTTP/1.1 204 No Content\r\n\r\n";
-        } else {
-            reply = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+            if(hash_value > node->id && hash_value > node->succ->id){
+                lookup_send(node, hash_value);
+
+            }
+            if(hash_value > node->succ->id && hash_value <= node->succ->succ->id){
+                struct Node* res = reply_check(node);
+                sprintf(reply, "HTTP/1.1 303 See Other\r\nLocation: http://%.*s:%d%.*s\r\nContent-Length: 0\r\n\r\n", (int) strlen(res->ip), res->ip, res->port,(int) strlen(request->uri), request->uri);
+            }
+
         }
-    } else if (strcmp(request->method, "DELETE") == 0) {
-        // Try to delete the requested resource from the 'resources' array
-        if (delete(request->uri, resources, MAX_RESOURCES)) {
-            reply = "HTTP/1.1 204 No Content\r\n\r\n";
-        } else {
-            reply = "HTTP/1.1 404 Not Found\r\n\r\n";
-        }
-    } else {
-        reply = "HTTP/1.1 501 Method Not Supported\r\n\r\n";
     }
+    else if(strcmp(request->method, "GET") == 0) {
+            // Find the resource with the given URI in the 'resources' array.
+            size_t resource_length;
+            const char* resource = get(request->uri, resources, MAX_RESOURCES, &resource_length);
+            if (resource) {
+                sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n%.*s", resource_length, (int) resource_length, resource);
+            } else {
+                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            }
+
+        } else if (strcmp(request->method, "PUT") == 0) {
+            // Try to set the requested resource with the given payload in the 'resources' array.
+            if (set(request->uri, request->payload, request->payload_length, resources, MAX_RESOURCES
+            )) {
+                reply = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+            } else {
+                reply = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+            }
+        } else if (strcmp(request->method, "DELETE") == 0) {
+            // Try to delete the requested resource from the 'resources' array
+            if (delete(request->uri, resources, MAX_RESOURCES)) {
+                reply = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+            } else {
+                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            }
+        } else {
+            reply = "HTTP/1.1 501 Method Not Supported\r\nContent-Length: 0\r\n\r\n";
+        }
 
     // Send the reply back to the client
     if (send(conn, reply, strlen(reply), 0) == -1) {
@@ -311,10 +363,13 @@ size_t process_packet(int conn, char* buffer, size_t n, struct Node* node) {
 
     };
     ssize_t bytes_processed = parse_request(buffer, n, &request);
-    unsigned short hash_value;
-    hash_value = hash(request.uri);
+
 
     if (bytes_processed > 0) {
+
+        unsigned short hash_value;
+        hash_value = hash(request.uri);
+
         send_reply(conn, &request, node, hash_value);
 
         // Check the "Connection" header in the request to determine if the connection should be kept alive or closed.
@@ -434,26 +489,30 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         return EXIT_FAILURE;
     }
-    Node* node;
-    if(argc == 4) {
-        node = initialize(argv[1], atoi(argv[2]), atoi(argv[3]));
-        Node* succ = initialize(getenv("SUCC_IP"), atoi(getenv("SUCC_PORT")), atoi(getenv("SUCC_ID")));
-        Node* pred = initialize(getenv("PRED_IP"), atoi(getenv("PRED_PORT")), atoi(getenv("PRED_ID")));
-        node->succ = succ;
-        node->pred = pred;
-        if(node->pred->id < node->id){
-            lookup_reply(node);
-        }
-    }
-    if(argc == 3){
-        node = initialize(argv[1], atoi(argv[2]), 0);
-    }
-
+    struct connection_state state = {0};
 
     struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
 
     // Set up a server socket.
     int server_socket = setup_server_socket(addr);
+
+    Node* node;
+    if(argc == 4) {
+        node = initialize(argv[1], atoi(argv[2]), atoi(argv[3]));
+        Node* succ = initialize(getenv("SUCC_IP"), atoi(getenv("SUCC_PORT")), atoi(getenv("SUCC_ID")));
+        Node* pred = initialize(getenv("PRED_IP"), atoi(getenv("PRED_PORT")), atoi(getenv("PRED_ID")));
+        succ->succ = pred;
+        pred->pred = succ;
+        node->succ = succ;
+        node->pred = pred;
+
+        if(node->pred->id == 0){
+            lookup_reply(node);
+        }
+    }
+    if(argc == 3){
+        node = NULL;
+    }
 
     //udp_socket
     int sockDgram = udp_node_socket(addr);
@@ -463,7 +522,7 @@ int main(int argc, char** argv) {
         { .fd = server_socket, .events = POLLIN },
     };
 
-    struct connection_state state = {0};
+
     while (true) {
 
         // Use poll() to wait for events on the monitored sockets.
